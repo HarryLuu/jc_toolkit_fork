@@ -119,7 +119,12 @@ extern int ir_sensor(ir_image_config &ir_cfg);
 extern int ir_sensor_config_live(ir_image_config &ir_cfg);
 extern int nfc_tag_info();
 extern int silence_input_report();
-int  handle_ok;
+
+// --- Global Identifiers for ZMQ ---
+// extern u8 global_mac_address[6];
+// extern u8 global_body_color[3];
+int handle_ok;
+
 bool enable_button_test;
 bool enable_IRVideoPhoto;
 bool enable_IRAutoExposure;

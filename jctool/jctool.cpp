@@ -15,6 +15,24 @@
 #include "hidapi.h"
 #include "hidapi_log.h"
 
+// --- START: ZERO MQ GLOBAL DECLARATION (Step 1) ---
+#include <zmq.hpp> // Include the ZeroMQ C++ header
+#include <iostream> // For std::cout and std::cerr logging
+
+// Global variables definitions
+u8 global_mac_address[6] = {0};
+u8 global_body_color[3] = {0}; // R, G, B
+u8 global_cached_id[10] = {0};
+
+// ZeroMQ constants
+const std::string ZEROMQ_ADDRESS = "tcp://localhost:5555"; // The address your Python script will connect to
+
+// Declare ZMQ objects GLOBALLY so they can be used in both ir_sensor() and get_raw_ir_image()
+zmq::context_t context(1); 
+zmq::socket_t publisher(context, ZMQ_PUB); 
+// --- END: ZERO MQ GLOBAL DECLARATION ---
+
+
 using namespace CppWinFormJoy;
 
 #pragma comment(lib, "SetupAPI")
@@ -271,6 +289,30 @@ int write_spi_data(u32 offset, const u16 write_len, u8* test_buf) {
 }
 
 
+void load_color_info() {
+    u8 spiColors[12];
+    memset(spiColors, 0, 12);
+
+    // 0x6050 is the SPI address for Factory Configuration of Body/Button Colors
+    // We read 12 bytes
+    int res = get_spi_data(0x6050, 12, spiColors);
+
+    if (res == 0) {
+        // Success! Save Body Color (First 3 bytes)
+        global_body_color[0] = spiColors[0]; // R
+        global_body_color[1] = spiColors[1]; // G
+        global_body_color[2] = spiColors[2]; // B
+        
+        // Optional: If you want Button Color too, you can save spiColors[3], [4], [5]
+    } else {
+        // Fallback to Grey if read fails
+        global_body_color[0] = 0x82;
+        global_body_color[1] = 0x82;
+        global_body_color[2] = 0x82;
+    }
+}
+
+
 int get_device_info(u8* test_buf) {
     int res;
     u8 buf[49];
@@ -302,6 +344,13 @@ int get_device_info(u8* test_buf) {
     for (int i = 0; i < 0xA; i++) {
         test_buf[i] = buf[0xF + i];
     }
+
+    // --- ADD THIS: Save MAC Address globally ---
+    // MAC is located at offsets 4 to 9 of the test_buf
+    for(int i=0; i<6; i++) {
+        global_mac_address[i] = test_buf[4+i]; 
+    }
+    // -------------------------------------------
 
     return 0;
 }
@@ -1392,6 +1441,39 @@ int ir_sensor_auto_exposure(int white_pixels_percent) {
 }
 
 
+// --- ADD THIS NEW FUNCTION BEFORE get_raw_ir_image ---
+#pragma unmanaged
+void send_zmq_frame_helper(u8* buf_image, int width, int height, int intensity) {
+    if (buf_image == nullptr) return;
+
+    size_t image_size = width * height * sizeof(uint8_t);
+    size_t metadata_size = 11; // 1 (Int) + 10 (Cached ID)
+    size_t total_size = image_size + metadata_size;
+
+    zmq::message_t message(total_size);
+    
+    // 1. Copy Image
+    memcpy(message.data(), buf_image, image_size);
+    
+    // 2. Append Metadata
+    uint8_t* footer = (uint8_t*)message.data() + image_size;
+    
+    // A. Intensity (Dynamic - changes every frame)
+    footer[0] = (uint8_t)intensity;
+    
+    // B. Cached ID (Static - copied in one go)
+    // Copies Type + MAC + Color all at once (10 bytes)
+    memcpy(footer + 1, global_cached_id, 10);
+
+    try {
+        publisher.send(message, zmq::send_flags::none);
+    } catch (const zmq::error_t& e) {
+        std::cerr << "Error sending IR frame: " << e.what() << std::endl;
+    }
+}
+#pragma managed
+
+
 int get_raw_ir_image(u8 show_status) {
     std::stringstream ir_status;
 
@@ -1430,6 +1512,10 @@ int get_raw_ir_image(u8 show_status) {
     buf[14] = 0x0;
     buf[47] = mcu_crc8_calc(buf + 11, 36);
     hid_write(handle, buf, sizeof(buf));
+
+    // We extract the managed values (width/height) here in the managed function
+    int w = FormJoy::myform1->ir_image_width;
+    int h = FormJoy::myform1->ir_image_height;
 
     // IR Read/ACK loop for fragmented data packets. 
     // It also avoids requesting missed data fragments, we just skip it to not complicate things.
@@ -1483,8 +1569,24 @@ int get_raw_ir_image(u8 show_status) {
 
                 // Check if final fragment. Draw the frame.
                 if (got_frag_no == ir_max_frag_no) {
+                    // PUBLISH FRAME VIA ZERO MQ
+                    // --- REPLACED ZMQ BLOCK ---
+    
+                    // We pass the raw pointer (buf_image) and integers to the unmanaged helper
+                    // Code gốc tính avg_intensity_percent ở dòng dưới, 
+                    // ta tính sớm hơn để gửi đi.
+                    // buf_reply[53] là giá trị thô (0-255), ta gửi luôn giá trị thô hoặc % đều được.
+                    // Ở đây tôi gửi % cho giống ý bạn (0-100).
+                    int intensity_val = (int)((buf_reply[53] * 100) / 255); 
+
+                    // Gọi helper mới với tham số intensity
+                    send_zmq_frame_helper(buf_image, w, h, intensity_val);
+                    // ---------------------------
+
                     // Update Viewport
                     elapsed_time2 = sw->ElapsedMilliseconds - elapsed_time2;
+                    
+                    // This line caused the error before, but now it is safe because we are in #pragma managed
                     FormJoy::myform1->setIRPictureWindow(buf_image, true);
 
                     //debug
@@ -2046,6 +2148,15 @@ step8:
     }
 
 step9:
+    // --- ZERO MQ PUBLISHER SETUP ---
+    try {
+        publisher.bind(ZEROMQ_ADDRESS);
+        std::cout << "ZeroMQ Publisher bound to " << ZEROMQ_ADDRESS << std::endl;
+    } catch (const zmq::error_t& e) {
+        std::cerr << "Error binding ZeroMQ socket: " << e.what() << std::endl;
+    }
+    // ---------------------------------
+
     // Stream or Capture images from NIR Camera
     if (enable_IRVideoPhoto)
         res_get = get_raw_ir_image(2);
@@ -2097,6 +2208,13 @@ step10:
     }
 
 stepf:
+    try {
+        publisher.unbind(ZEROMQ_ADDRESS);
+        std::cout << "ZeroMQ Publisher unbound from " << ZEROMQ_ADDRESS << std::endl;
+    } catch (const zmq::error_t& e) {
+        std::cerr << "Error unbinding ZeroMQ socket: " << e.what() << std::endl;
+    }
+    // -----------------------------------------
     return res_get;
 }
 
@@ -2912,29 +3030,80 @@ int test_chamber() {
     return 0;
     }
 
+
+void build_cached_id(int device_type) {
+    // Byte 0: Device Type
+    global_cached_id[0] = (u8)device_type;
+    
+    // Byte 1-6: MAC Address
+    memcpy(global_cached_id + 1, global_mac_address, 6);
+    
+    // Byte 7-9: Body Color
+    memcpy(global_cached_id + 7, global_body_color, 3);
+}
+
+
 int device_connection(){
     if (check_connection_ok) {
         handle_ok = 0;
-        // Joy-Con (L)
+        
+        // 1. Try to open Joy-Con (L)
         if (handle = hid_open(0x57e, 0x2006, nullptr)) {
             handle_ok = 1;
-            return handle_ok;
         }
-        // Joy-Con (R)
-        if (handle = hid_open(0x57e, 0x2007, nullptr)) {
+        // 2. Try to open Joy-Con (R)
+        else if (handle = hid_open(0x57e, 0x2007, nullptr)) {
             handle_ok = 2;
-            return handle_ok;
         }
-        // Pro Controller
-        if (handle = hid_open(0x57e, 0x2009, nullptr)) {
+        // 3. Try to open Pro Controller
+        else if (handle = hid_open(0x57e, 0x2009, nullptr)) {
             handle_ok = 3;
-            return handle_ok;
         }
-        // Nothing found
+
+        // --- SUCCESS BLOCK ---
+        if (handle_ok != 0) {
+            // 1. Get MAC
+            u8 tmp_buf[10];
+            get_device_info(tmp_buf); 
+
+            // 2. Get Color
+            load_color_info();
+            
+            // 3. NEW: Build the Static ID Cache
+            build_cached_id(handle_ok);
+
+            return handle_ok;
+        } 
+        // --- FAILURE BLOCK ---
         else {
             return 0;
         }
     }
+    return handle_ok;
+    
+    // ORIGINAL CODE:
+    // if (check_connection_ok) {
+    //     handle_ok = 0;
+    //     // Joy-Con (L)
+    //     if (handle = hid_open(0x57e, 0x2006, nullptr)) {
+    //         handle_ok = 1;
+    //         return handle_ok;
+    //     }
+    //     // Joy-Con (R)
+    //     if (handle = hid_open(0x57e, 0x2007, nullptr)) {
+    //         handle_ok = 2;
+    //         return handle_ok;
+    //     }
+    //     // Pro Controller
+    //     if (handle = hid_open(0x57e, 0x2009, nullptr)) {
+    //         handle_ok = 3;
+    //         return handle_ok;
+    //     }
+    //     // Nothing found
+    //     else {
+    //         return 0;
+    //     }
+    // }
     /*
     //usb test
     if (!handle_ok) {
@@ -2953,7 +3122,7 @@ int device_connection(){
         hid_free_enumeration(devs);
     }
     */
-    return handle_ok;
+    // return handle_ok;
 }
 
 [STAThread]
